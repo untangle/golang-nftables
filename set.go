@@ -111,12 +111,19 @@ var (
 	TypeFIBAddr     = SetDatatype{Name: "fib_addrtype", Bytes: 4, nftMagic: 38}
 	TypeBoolean     = SetDatatype{Name: "boolean", Bytes: 1, nftMagic: 39}
 	TypeCTEventBit  = SetDatatype{Name: "ct_event", Bytes: 4, nftMagic: 40}
-	TypeIFName      = SetDatatype{Name: "ifname", Bytes: ifNameSize, nftMagic: 41}
-	TypeIGMPType    = SetDatatype{Name: "igmp_type", Bytes: 1, nftMagic: 42}
-	TypeTimeDate    = SetDatatype{Name: "time", Bytes: 8, nftMagic: 43}
-	TypeTimeHour    = SetDatatype{Name: "hour", Bytes: 4, nftMagic: 44}
-	TypeTimeDay     = SetDatatype{Name: "day", Bytes: 1, nftMagic: 45}
-	TypeCGroupV2    = SetDatatype{Name: "cgroupsv2", Bytes: 8, nftMagic: 46}
+
+	// See the nftables patch: https://github.com/untangle/mfw_feeds/blob/f8b948b8a3c86cc20e921c95d5c9a6de3a7abf70/nftables/patches/999-nftables-Add-dict.patch#L41
+	//
+	// int32
+	// int64
+	// bool
+	TypeCtID     = SetDatatype{Name: "ctid", Bytes: 4, nftMagic: 44}
+	TypeIFName   = SetDatatype{Name: "ifname", Bytes: ifNameSize, nftMagic: 45}
+	TypeIGMPType = SetDatatype{Name: "igmp_type", Bytes: 1, nftMagic: 46}
+	TypeTimeDate = SetDatatype{Name: "time", Bytes: 8, nftMagic: 47}
+	TypeTimeHour = SetDatatype{Name: "hour", Bytes: 8, nftMagic: 48}
+	TypeTimeDay  = SetDatatype{Name: "day", Bytes: 1, nftMagic: 49}
+	TypeCGroupV2 = SetDatatype{Name: "cgroupsv2", Bytes: 8, nftMagic: 50}
 
 	nftDatatypes = []SetDatatype{
 		TypeVerdict,
