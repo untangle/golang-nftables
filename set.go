@@ -162,6 +162,7 @@ var (
 		TypeFIBAddr.Name:     TypeFIBAddr,
 		TypeBoolean.Name:     TypeBoolean,
 		TypeCTEventBit.Name:  TypeCTEventBit,
+		TypeCtID.Name:        TypeCtID,
 		TypeIFName.Name:      TypeIFName,
 		TypeIGMPType.Name:    TypeIGMPType,
 		TypeTimeDate.Name:    TypeTimeDate,
