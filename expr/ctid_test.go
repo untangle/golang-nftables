@@ -9,6 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// TestCtid tests that the CtID expression can be marshaled and
+// unmarshaled correctly.
 func TestCtid(t *testing.T) {
 	t.Parallel()
 	id := CtID{
