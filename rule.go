@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/internal/parseexprfunc"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -86,7 +87,7 @@ func (cc *Conn) GetRules(t *Table, c *Chain) ([]*Rule, error) {
 		return nil, fmt.Errorf("SendMessages: %v", err)
 	}
 
-	reply, err := conn.Receive()
+	reply, err := receiveAckAware(conn, message.Header.Flags)
 	if err != nil {
 		return nil, fmt.Errorf("Receive: %v", err)
 	}
@@ -96,9 +97,6 @@ func (cc *Conn) GetRules(t *Table, c *Chain) ([]*Rule, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Carry over all Table attributes (including Family), as the Table
-		// object which ruleFromMsg creates only contains the name.
-		r.Table = t
 		rules = append(rules, r)
 	}
 
@@ -131,6 +129,17 @@ func (cc *Conn) newRule(r *Rule, op ruleOperation) *Rule {
 	data = append(data, cc.marshalAttr([]netlink.Attribute{
 		{Type: unix.NLA_F_NESTED | unix.NFTA_RULE_EXPRESSIONS, Data: cc.marshalAttr(exprAttrs)},
 	})...)
+
+	if compatPolicy, err := getCompatPolicy(r.Exprs); err != nil {
+		cc.setErr(err)
+	} else if compatPolicy != nil {
+		data = append(data, cc.marshalAttr([]netlink.Attribute{
+			{Type: unix.NLA_F_NESTED | unix.NFTA_RULE_COMPAT, Data: cc.marshalAttr([]netlink.Attribute{
+				{Type: unix.NFTA_RULE_COMPAT_PROTO, Data: binaryutil.BigEndian.PutUint32(compatPolicy.Proto)},
+				{Type: unix.NFTA_RULE_COMPAT_FLAGS, Data: binaryutil.BigEndian.PutUint32(compatPolicy.Flag & nft_RULE_COMPAT_F_MASK)},
+			})},
+		})...)
+	}
 
 	msgData := []byte{}
 
@@ -215,99 +224,6 @@ func (cc *Conn) DelRule(r *Rule) error {
 	return nil
 }
 
-func exprsFromMsg(fam TableFamily, b []byte) ([]expr.Any, error) {
-	ad, err := netlink.NewAttributeDecoder(b)
-	if err != nil {
-		return nil, err
-	}
-	ad.ByteOrder = binary.BigEndian
-	var exprs []expr.Any
-	for ad.Next() {
-		ad.Do(func(b []byte) error {
-			ad, err := netlink.NewAttributeDecoder(b)
-			if err != nil {
-				return err
-			}
-			ad.ByteOrder = binary.BigEndian
-			var name string
-			for ad.Next() {
-				switch ad.Type() {
-				case unix.NFTA_EXPR_NAME:
-					name = ad.String()
-					if name == "notrack" {
-						e := &expr.Notrack{}
-						exprs = append(exprs, e)
-					}
-				case unix.NFTA_EXPR_DATA:
-					var e expr.Any
-					switch name {
-					case "ct":
-						e = &expr.Ct{}
-					case "range":
-						e = &expr.Range{}
-					case "meta":
-						e = &expr.Meta{}
-					case "cmp":
-						e = &expr.Cmp{}
-					case "counter":
-						e = &expr.Counter{}
-					case "payload":
-						e = &expr.Payload{}
-					case "lookup":
-						e = &expr.Lookup{}
-					case "immediate":
-						e = &expr.Immediate{}
-					case "bitwise":
-						e = &expr.Bitwise{}
-					case "redir":
-						e = &expr.Redir{}
-					case "nat":
-						e = &expr.NAT{}
-					case "limit":
-						e = &expr.Limit{}
-					case "quota":
-						e = &expr.Quota{}
-					case "dynset":
-						e = &expr.Dynset{}
-					case "log":
-						e = &expr.Log{}
-					case "exthdr":
-						e = &expr.Exthdr{}
-					case "match":
-						e = &expr.Match{}
-					case "target":
-						e = &expr.Target{}
-					}
-					if e == nil {
-						// TODO: introduce an opaque expression type so that users know
-						// something is here.
-						continue // unsupported expression type
-					}
-
-					ad.Do(func(b []byte) error {
-						if err := expr.Unmarshal(byte(fam), b, e); err != nil {
-							return err
-						}
-						// Verdict expressions are a special-case of immediate expressions, so
-						// if the expression is an immediate writing nothing into the verdict
-						// register (invalid), re-parse it as a verdict expression.
-						if imm, isImmediate := e.(*expr.Immediate); isImmediate && imm.Register == unix.NFT_REG_VERDICT && len(imm.Data) == 0 {
-							e = &expr.Verdict{}
-							if err := expr.Unmarshal(byte(fam), b, e); err != nil {
-								return err
-							}
-						}
-						exprs = append(exprs, e)
-						return nil
-					})
-				}
-			}
-			return ad.Err()
-		})
-	}
-	return exprs, ad.Err()
-}
-
 func ruleFromMsg(fam TableFamily, msg netlink.Message) (*Rule, error) {
 	if got, want := msg.Header.Type, ruleHeaderType; got != want {
 		return nil, fmt.Errorf("unexpected header type: got %v, want %v", got, want)
@@ -329,8 +245,15 @@ func ruleFromMsg(fam TableFamily, msg netlink.Message) (*Rule, error) {
 			r.Chain = &Chain{Name: ad.String()}
 		case unix.NFTA_RULE_EXPRESSIONS:
 			ad.Do(func(b []byte) error {
-				r.Exprs, err = exprsFromMsg(fam, b)
-				return err
+				exprs, err := parseexprfunc.ParseExprMsgFunc(byte(fam), b)
+				if err != nil {
+					return err
+				}
+				r.Exprs = make([]expr.Any, len(exprs))
+				for i := range exprs {
+					r.Exprs[i] = exprs[i].(expr.Any)
+				}
+				return nil
 			})
 		case unix.NFTA_RULE_POSITION:
 			r.Position = ad.Uint64()

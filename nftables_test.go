@@ -22,7 +22,6 @@ import (
 	"net"
 	"os"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -31,14 +30,12 @@ import (
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"github.com/google/nftables/internal/nftest"
+	"github.com/google/nftables/xt"
 	"github.com/mdlayher/netlink"
-	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
 
-var (
-	enableSysTests = flag.Bool("run_system_tests", false, "Run tests that operate against the live kernel")
-)
+var enableSysTests = flag.Bool("run_system_tests", false, "Run tests that operate against the live kernel")
 
 // nfdump returns a hexdump of 4 bytes per line (like nft --debug=all), allowing
 // users to make sense of large byte literals more easily.
@@ -86,45 +83,11 @@ func ifname(n string) []byte {
 	return b
 }
 
-// openSystemNFTConn returns a netlink connection that tests against
-// the running kernel in a separate network namespace.
-// cleanupSystemNFTConn() must be called from a defer to cleanup
-// created network namespace.
-func openSystemNFTConn(t *testing.T) (*nftables.Conn, netns.NsHandle) {
-	t.Helper()
-	if !*enableSysTests {
-		t.SkipNow()
-	}
-	// We lock the goroutine into the current thread, as namespace operations
-	// such as those invoked by `netns.New()` are thread-local. This is undone
-	// in cleanupSystemNFTConn().
-	runtime.LockOSThread()
-
-	ns, err := netns.New()
-	if err != nil {
-		t.Fatalf("netns.New() failed: %v", err)
-	}
-	c, err := nftables.New(nftables.WithNetNSFd(int(ns)))
-	if err != nil {
-		t.Fatalf("nftables.New() failed: %v", err)
-	}
-	return c, ns
-}
-
-func cleanupSystemNFTConn(t *testing.T, newNS netns.NsHandle) {
-	defer runtime.UnlockOSThread()
-
-	if err := newNS.Close(); err != nil {
-		t.Fatalf("newNS.Close() failed: %v", err)
-	}
-}
-
 func TestRuleOperations(t *testing.T) {
-
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -579,9 +542,86 @@ func TestConfigureNATSourceAddress(t *testing.T) {
 	}
 }
 
+func TestMasqMarshalUnmarshal(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   "filter",
+	})
+	postrouting := c.AddChain(&nftables.Chain{
+		Name:     "postrouting",
+		Table:    filter,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookPostrouting,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	min := uint32(1)
+	max := uint32(3)
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: postrouting,
+		Exprs: []expr.Any{
+			&expr.Masq{
+				ToPorts:     true,
+				RegProtoMin: min,
+				RegProtoMax: max,
+			},
+		},
+	})
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(
+		&nftables.Table{
+			Family: nftables.TableFamilyINet,
+			Name:   "filter",
+		},
+		&nftables.Chain{
+			Name: "postrouting",
+		},
+	)
+	if err != nil {
+		t.Fatalf("c.GetRules() failed: %v", err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected rule count: got %d, want %d", got, want)
+	}
+
+	rule := rules[0]
+	if got, want := len(rule.Exprs), 1; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+
+	me, ok := rule.Exprs[0].(*expr.Masq)
+	if !ok {
+		t.Fatalf("unexpected expression type: got %T, want *expr.Masq", rule.Exprs[0])
+	}
+
+	if got, want := me.ToPorts, true; got != want {
+		t.Errorf("unexpected masq random flag: got %v, want %v", got, want)
+	}
+
+	if got, want := me.RegProtoMin, min; got != want {
+		t.Errorf("unexpected reg proto min: got %d, want %d", got, want)
+	}
+
+	if got, want := me.RegProtoMax, max; got != want {
+		t.Errorf("unexpected reg proto max: got %d, want %d", got, want)
+	}
+}
+
 func TestExprLogOptions(t *testing.T) {
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -725,8 +765,8 @@ func TestExprLogOptions(t *testing.T) {
 }
 
 func TestExprLogPrefix(t *testing.T) {
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -801,15 +841,15 @@ func TestGetRules(t *testing.T) {
 	// strace -f -v -x -s 2048 -eraw=sendto nft list chain ip filter forward
 
 	want := [][]byte{
-		[]byte{0x2, 0x0, 0x0, 0x0, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x0, 0x0, 0x0},
+		{0x2, 0x0, 0x0, 0x0, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x0, 0x0, 0x0},
 	}
 
 	// The reply messages come from adding log.Printf("msgs: %#v", msgs) to
 	// (*github.com/mdlayher/netlink/Conn).receive
 	reply := [][]netlink.Message{
 		nil,
-		[]netlink.Message{netlink.Message{Header: netlink.Header{Length: 0x68, Type: 0xa06, Flags: 0x802, Sequence: 0x9acb0443, PID: 0xba38ef3c}, Data: []uint8{0x2, 0x0, 0x0, 0xc, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xc, 0x0, 0x2, 0x0, 0x66, 0x6f, 0x72, 0x77, 0x61, 0x72, 0x64, 0x0, 0xc, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x30, 0x0, 0x4, 0x0, 0x2c, 0x0, 0x1, 0x0, 0xc, 0x0, 0x1, 0x0, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x65, 0x72, 0x0, 0x1c, 0x0, 0x2, 0x0, 0xc, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x6d, 0x92, 0x20, 0x20, 0xc, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xa, 0x48, 0xd9}}},
-		[]netlink.Message{netlink.Message{Header: netlink.Header{Length: 0x14, Type: 0x3, Flags: 0x2, Sequence: 0x9acb0443, PID: 0xba38ef3c}, Data: []uint8{0x0, 0x0, 0x0, 0x0}}},
+		{{Header: netlink.Header{Length: 0x68, Type: 0xa06, Flags: 0x802, Sequence: 0x9acb0443, PID: 0xba38ef3c}, Data: []uint8{0x2, 0x0, 0x0, 0xc, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xc, 0x0, 0x2, 0x0, 0x66, 0x6f, 0x72, 0x77, 0x61, 0x72, 0x64, 0x0, 0xc, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2, 0x30, 0x0, 0x4, 0x0, 0x2c, 0x0, 0x1, 0x0, 0xc, 0x0, 0x1, 0x0, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x65, 0x72, 0x0, 0x1c, 0x0, 0x2, 0x0, 0xc, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x6d, 0x92, 0x20, 0x20, 0xc, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xa, 0x48, 0xd9}}},
+		{{Header: netlink.Header{Length: 0x14, Type: 0x3, Flags: 0x2, Sequence: 0x9acb0443, PID: 0xba38ef3c}, Data: []uint8{0x0, 0x0, 0x0, 0x0}}},
 	}
 
 	c, err := nftables.New(nftables.WithTestDial(
@@ -1143,7 +1183,7 @@ func TestTProxy(t *testing.T) {
 			Name:     "divert",
 			Type:     nftables.ChainTypeFilter,
 			Hooknum:  nftables.ChainHookPrerouting,
-			Priority: -150,
+			Priority: nftables.ChainPriorityRef(-150),
 		},
 		Exprs: []expr.Any{
 			//	[ payload load 1b @ network header + 9 => reg 1 ]
@@ -1157,6 +1197,74 @@ func TestTProxy(t *testing.T) {
 				Family:      byte(nftables.TableFamilyIPv4),
 				TableFamily: byte(nftables.TableFamilyIPv4),
 				RegPort:     1,
+			},
+		},
+	})
+
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTProxyWithAddrField(t *testing.T) {
+	want := [][]byte{
+		// batch begin
+		[]byte("\x00\x00\x00\x0a"),
+		// nft add rule filter divert ip protocol tcp tproxy to 10.10.72.1:50080
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x66\x69\x6c\x74\x65\x72\x00\x00\x0b\x00\x02\x00\x64\x69\x76\x65\x72\x74\x00\x00\xe8\x00\x04\x80\x34\x00\x01\x80\x0c\x00\x01\x00\x70\x61\x79\x6c\x6f\x61\x64\x00\x24\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x09\x08\x00\x04\x00\x00\x00\x00\x01\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x0c\x00\x03\x80\x05\x00\x01\x00\x06\x00\x00\x00\x2c\x00\x01\x80\x0e\x00\x01\x00\x69\x6d\x6d\x65\x64\x69\x61\x74\x65\x00\x00\x00\x18\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x0c\x00\x02\x80\x08\x00\x01\x00\x0a\x0a\x48\x01\x2c\x00\x01\x80\x0e\x00\x01\x00\x69\x6d\x6d\x65\x64\x69\x61\x74\x65\x00\x00\x00\x18\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x02\x0c\x00\x02\x80\x06\x00\x01\x00\xc3\xa0\x00\x00\x2c\x00\x01\x80\x0b\x00\x01\x00\x74\x70\x72\x6f\x78\x79\x00\x00\x1c\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x02\x08\x00\x03\x00\x00\x00\x00\x02\x08\x00\x02\x00\x00\x00\x00\x01"),
+		// batch end
+		[]byte("\x00\x00\x00\x0a"),
+	}
+
+	c, err := nftables.New(nftables.WithTestDial(
+		func(req []netlink.Message) ([]netlink.Message, error) {
+			for idx, msg := range req {
+				b, err := msg.MarshalBinary()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(b) < 16 {
+					continue
+				}
+				b = b[16:]
+				if len(want) == 0 {
+					t.Errorf("no want entry for message %d: %x", idx, b)
+					continue
+				}
+				if got, want := b, want[0]; !bytes.Equal(got, want) {
+					t.Errorf("message %d: %s", idx, linediff(nfdump(got), nfdump(want)))
+				}
+				want = want[1:]
+			}
+			return req, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.AddRule(&nftables.Rule{
+		Table: &nftables.Table{Name: "filter", Family: nftables.TableFamilyIPv4},
+		Chain: &nftables.Chain{
+			Name:     "divert",
+			Type:     nftables.ChainTypeFilter,
+			Hooknum:  nftables.ChainHookPrerouting,
+			Priority: nftables.ChainPriorityRef(-150),
+		},
+		Exprs: []expr.Any{
+			//	[ payload load 1b @ network header + 9 => reg 1 ]
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 9, Len: 1},
+			//	[ cmp eq reg 1 0x00000006 ]
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+			//	[ immediate reg 1 0x01480a0a ]
+			&expr.Immediate{Register: 1, Data: []byte("\x0a\x0a\x48\x01")},
+			//	[ immediate reg 2 0x0000a0c3 ]
+			&expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(50080)},
+			//	[ tproxy ip addr reg 1 port reg 2 ]
+			&expr.TProxy{
+				Family:      byte(nftables.TableFamilyIPv4),
+				TableFamily: byte(nftables.TableFamilyIPv4),
+				RegAddr:     1,
+				RegPort:     2,
 			},
 		},
 	})
@@ -1384,7 +1492,7 @@ func TestAddRuleWithPosition(t *testing.T) {
 			Name:     "ipv4chain-1",
 			Type:     nftables.ChainTypeFilter,
 			Hooknum:  nftables.ChainHookPrerouting,
-			Priority: 0,
+			Priority: nftables.ChainPriorityRef(0),
 		},
 
 		Exprs: []expr.Any{
@@ -1523,8 +1631,8 @@ func TestListChains(t *testing.T) {
 		},
 		{
 			Name:     "undef",
-			Hooknum:  0,
-			Priority: 0,
+			Hooknum:  nil,
+			Priority: nil,
 			Policy:   nil,
 		},
 	}
@@ -1564,8 +1672,16 @@ func TestListChains(t *testing.T) {
 
 	for i, chain := range chains {
 		validate(chain.Name, want[i].Name, "name", i)
-		validate(chain.Hooknum, want[i].Hooknum, "hooknum", i)
-		validate(chain.Priority, want[i].Priority, "priority", i)
+		if want[i].Hooknum != nil && chain.Hooknum != nil {
+			validate(*chain.Hooknum, *want[i].Hooknum, "hooknum value", i)
+		} else {
+			validate(chain.Hooknum, want[i].Hooknum, "hooknum pointer", i)
+		}
+		if want[i].Priority != nil && chain.Priority != nil {
+			validate(*chain.Priority, *want[i].Priority, "priority value", i)
+		} else {
+			validate(chain.Priority, want[i].Priority, "priority pointer", i)
+		}
 		validate(chain.Type, want[i].Type, "type", i)
 
 		if want[i].Policy != nil && chain.Policy != nil {
@@ -1574,7 +1690,6 @@ func TestListChains(t *testing.T) {
 			validate(chain.Policy, want[i].Policy, "policy pointer", i)
 		}
 	}
-
 }
 
 func TestAddChain(t *testing.T) {
@@ -1588,7 +1703,7 @@ func TestAddChain(t *testing.T) {
 			chain: &nftables.Chain{
 				Name:     "base-chain",
 				Hooknum:  nftables.ChainHookPrerouting,
-				Priority: 0,
+				Priority: nftables.ChainPriorityRef(0),
 				Type:     nftables.ChainTypeFilter,
 			},
 			want: [][]byte{
@@ -1671,7 +1786,7 @@ func TestDelChain(t *testing.T) {
 			chain: &nftables.Chain{
 				Name:     "base-chain",
 				Hooknum:  nftables.ChainHookPrerouting,
-				Priority: 0,
+				Priority: nftables.ChainPriorityRef(0),
 				Type:     nftables.ChainTypeFilter,
 			},
 			want: [][]byte{
@@ -1736,20 +1851,22 @@ func TestDelChain(t *testing.T) {
 		}
 	}
 }
+
 func TestGetObjReset(t *testing.T) {
 	// The want byte sequences come from stracing nft(8), e.g.:
 	// strace -f -v -x -s 2048 -eraw=sendto nft list chain ip filter forward
 
 	want := [][]byte{
-		[]byte{0x2, 0x0, 0x0, 0x0, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x66, 0x77, 0x64, 0x65, 0x64, 0x0, 0x0, 0x0, 0x8, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x1},
+		{0x2, 0x0, 0x0, 0x0, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x66, 0x77, 0x64, 0x65, 0x64, 0x0, 0x0, 0x0, 0x8, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x1},
 	}
 
 	// The reply messages come from adding log.Printf("msgs: %#v", msgs) to
 	// (*github.com/mdlayher/netlink/Conn).receive
 	reply := [][]netlink.Message{
 		nil,
-		[]netlink.Message{netlink.Message{Header: netlink.Header{Length: 0x64, Type: 0xa12, Flags: 0x802, Sequence: 0x9acb0443, PID: 0xde9}, Data: []uint8{0x2, 0x0, 0x0, 0x10, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x66, 0x77, 0x64, 0x65, 0x64, 0x0, 0x0, 0x0, 0x8, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x1, 0x8, 0x0, 0x5, 0x0, 0x0, 0x0, 0x0, 0x1, 0x1c, 0x0, 0x4, 0x0, 0xc, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x4, 0x61, 0xc, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x9, 0xc, 0x0, 0x6, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2}}},
-		[]netlink.Message{netlink.Message{Header: netlink.Header{Length: 0x14, Type: 0x3, Flags: 0x2, Sequence: 0x9acb0443, PID: 0xde9}, Data: []uint8{0x0, 0x0, 0x0, 0x0}}},
+		{{Header: netlink.Header{Length: 0x64, Type: 0xa12, Flags: 0x802, Sequence: 0x9acb0443, PID: 0xde9}, Data: []uint8{0x2, 0x0, 0x0, 0x10, 0xb, 0x0, 0x1, 0x0, 0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x0, 0x0, 0xa, 0x0, 0x2, 0x0, 0x66, 0x77, 0x64, 0x65, 0x64, 0x0, 0x0, 0x0, 0x8, 0x0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x1, 0x8, 0x0, 0x5, 0x0, 0x0, 0x0, 0x0, 0x1, 0x1c, 0x0, 0x4, 0x0, 0xc, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x4, 0x61, 0xc, 0x0, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x9, 0xc, 0x0, 0x6, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2}}},
+		{{Header: netlink.Header{Length: 0x14, Type: 0x3, Flags: 0x2, Sequence: 0x9acb0443, PID: 0xde9}, Data: []uint8{0x0, 0x0, 0x0, 0x0}}},
+		{{Header: netlink.Header{Length: 36, Type: netlink.Error, Flags: 0x100, Sequence: 0x9acb0443, PID: 0xde9}, Data: []uint8{0, 0, 0, 0, 88, 0, 0, 0, 12, 10, 5, 4, 143, 109, 199, 146, 236, 9, 0, 0}}},
 	}
 
 	c, err := nftables.New(nftables.WithTestDial(
@@ -1785,7 +1902,6 @@ func TestGetObjReset(t *testing.T) {
 		Table: filter,
 		Name:  "fwded",
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1815,8 +1931,8 @@ func TestObjAPI(t *testing.T) {
 
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
@@ -1877,7 +1993,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	objs, err := c.GetObjects(table)
-
 	if err != nil {
 		t.Errorf("c.GetObjects(table) failed: %v failed", err)
 	}
@@ -1887,7 +2002,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	objsOther, err := c.GetObjects(tableOther)
-
 	if err != nil {
 		t.Errorf("c.GetObjects(tableOther) failed: %v failed", err)
 	}
@@ -1897,7 +2011,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	obj1, err := c.GetObject(counter1)
-
 	if err != nil {
 		t.Errorf("c.GetObject(counter1) failed: %v failed", err)
 	}
@@ -1913,7 +2026,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	obj2, err := c.GetObject(counter2)
-
 	if err != nil {
 		t.Errorf("c.GetObject(counter2) failed: %v failed", err)
 	}
@@ -1955,7 +2067,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	legacy, err := c.GetObj(counter1)
-
 	if err != nil {
 		t.Errorf("c.GetObj(counter1) failed: %v failed", err)
 	}
@@ -1965,7 +2076,6 @@ func TestObjAPI(t *testing.T) {
 	}
 
 	legacyReset, err := c.GetObjReset(counter1)
-
 	if err != nil {
 		t.Errorf("c.GetObjReset(counter1) failed: %v failed", err)
 	}
@@ -1973,7 +2083,6 @@ func TestObjAPI(t *testing.T) {
 	if len(legacyReset) != 2 {
 		t.Errorf("unexpected number of objects: got %d, want %d", len(legacyReset), 2)
 	}
-
 }
 
 func TestConfigureClamping(t *testing.T) {
@@ -2449,11 +2558,89 @@ func TestCreateUseAnonymousSet(t *testing.T) {
 	}
 }
 
+func TestCappedErrMsgOnSets(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	c, err := nftables.New(nftables.WithNetNSFd(int(newNS)), nftables.AsLasting())
+	if err != nil {
+		t.Fatalf("nftables.New() failed: %v", err)
+	}
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+	if err := c.Flush(); err != nil {
+		t.Errorf("failed adding table: %v", err)
+	}
+	tables, err := c.ListTablesOfFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		t.Errorf("failed to list IPv4 tables: %v", err)
+	}
+
+	for _, t := range tables {
+		if t.Name == "filter" {
+			filter = t
+			break
+		}
+	}
+
+	ifSet := &nftables.Set{
+		Table:   filter,
+		Name:    "if_set",
+		KeyType: nftables.TypeIFName,
+	}
+	if err := c.AddSet(ifSet, nil); err != nil {
+		t.Errorf("c.AddSet(ifSet) failed: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Errorf("failed adding set ifSet: %v", err)
+	}
+	ifSet, err = c.GetSetByName(filter, "if_set")
+	if err != nil {
+		t.Fatalf("failed getting set by name: %v", err)
+	}
+
+	elems, err := c.GetSetElements(ifSet)
+	if err != nil {
+		t.Errorf("failed getting set elements (ifSet): %v", err)
+	}
+
+	if got, want := len(elems), 0; got != want {
+		t.Errorf("first GetSetElements(ifSet) call len not equal: got %d, want %d", got, want)
+	}
+
+	elements := []nftables.SetElement{
+		{Key: []byte("012345678912345\x00")},
+	}
+	if err := c.SetAddElements(ifSet, elements); err != nil {
+		t.Errorf("adding SetElements(ifSet) failed: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Errorf("failed adding set elements ifSet: %v", err)
+	}
+
+	elems, err = c.GetSetElements(ifSet)
+	if err != nil {
+		t.Fatalf("failed getting set elements (ifSet): %v", err)
+	}
+
+	if got, want := len(elems), 1; got != want {
+		t.Fatalf("second GetSetElements(ifSet) call len not equal: got %d, want %d", got, want)
+	}
+
+	if got, want := elems, elements; !reflect.DeepEqual(elems, elements) {
+		t.Errorf("SetElements(ifSet) not equal: got %v, want %v", got, want)
+	}
+}
+
 func TestCreateUseNamedSet(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2465,7 +2652,7 @@ func TestCreateUseNamedSet(t *testing.T) {
 
 	portSet := &nftables.Set{
 		Table:   filter,
-		Name:    "kek",
+		Name:    "test",
 		KeyType: nftables.TypeInetService,
 	}
 	if err := c.AddSet(portSet, nil); err != nil {
@@ -2497,8 +2684,8 @@ func TestCreateUseNamedSet(t *testing.T) {
 	if len(sets) != 2 {
 		t.Fatalf("len(sets) = %d, want 2", len(sets))
 	}
-	if sets[0].Name != "kek" {
-		t.Errorf("set[0].Name = %q, want kek", sets[0].Name)
+	if sets[0].Name != "test" {
+		t.Errorf("set[0].Name = %q, want test", sets[0].Name)
 	}
 	if sets[1].Name != "IPs_4_dayz" {
 		t.Errorf("set[1].Name = %q, want IPs_4_dayz", sets[1].Name)
@@ -2506,11 +2693,10 @@ func TestCreateUseNamedSet(t *testing.T) {
 }
 
 func TestIP6SetAddElements(t *testing.T) {
-
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2555,11 +2741,11 @@ func TestIP6SetAddElements(t *testing.T) {
 	}
 }
 
-func TestCreateDeleteNamedSet(t *testing.T) {
+func TestCreateUseCounterSet(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2571,7 +2757,50 @@ func TestCreateDeleteNamedSet(t *testing.T) {
 
 	portSet := &nftables.Set{
 		Table:   filter,
-		Name:    "kek",
+		Name:    "test",
+		KeyType: nftables.TypeInetService,
+		Counter: true,
+	}
+	if err := c.AddSet(portSet, nil); err != nil {
+		t.Errorf("c.AddSet(portSet) failed: %v", err)
+	}
+	if err := c.SetAddElements(portSet, []nftables.SetElement{{Key: binaryutil.BigEndian.PutUint16(22)}}); err != nil {
+		t.Errorf("c.SetVal(portSet) failed: %v", err)
+	}
+
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	sets, err := c.GetSets(filter)
+	if err != nil {
+		t.Errorf("c.GetSets() failed: %v", err)
+	}
+	if len(sets) != 1 {
+		t.Fatalf("len(sets) = %d, want 1", len(sets))
+	}
+	if sets[0].Name != "test" {
+		t.Errorf("set[0].Name = %q, want test", sets[0].Name)
+	}
+}
+
+func TestCreateDeleteNamedSet(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+
+	portSet := &nftables.Set{
+		Table:   filter,
+		Name:    "test",
 		KeyType: nftables.TypeInetService,
 	}
 	if err := c.AddSet(portSet, nil); err != nil {
@@ -2599,8 +2828,8 @@ func TestCreateDeleteNamedSet(t *testing.T) {
 func TestDeleteElementNamedSet(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2612,7 +2841,7 @@ func TestDeleteElementNamedSet(t *testing.T) {
 
 	portSet := &nftables.Set{
 		Table:   filter,
-		Name:    "kek",
+		Name:    "test",
 		KeyType: nftables.TypeInetService,
 	}
 	if err := c.AddSet(portSet, []nftables.SetElement{{Key: []byte{0, 22}}, {Key: []byte{0, 23}}}); err != nil {
@@ -2646,8 +2875,8 @@ func TestFlushNamedSet(t *testing.T) {
 	}
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2659,7 +2888,7 @@ func TestFlushNamedSet(t *testing.T) {
 
 	portSet := &nftables.Set{
 		Table:   filter,
-		Name:    "kek",
+		Name:    "test",
 		KeyType: nftables.TypeInetService,
 	}
 	if err := c.AddSet(portSet, []nftables.SetElement{{Key: []byte{0, 22}}, {Key: []byte{0, 23}}}); err != nil {
@@ -2687,8 +2916,8 @@ func TestFlushNamedSet(t *testing.T) {
 func TestSetElementsInterval(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2754,11 +2983,239 @@ func TestSetElementsInterval(t *testing.T) {
 	}
 }
 
+func TestCreateListFlowtable(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := &nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	}
+
+	flowtable := &nftables.Flowtable{
+		Table: filter,
+		Name:  "flowtable_test",
+	}
+
+	c.AddTable(filter)
+	c.AddFlowtable(flowtable)
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	flowtables, err := c.ListFlowtables(filter)
+	if err != nil {
+		t.Fatalf("c.ListFlowtables() failed: %v", err)
+	}
+
+	if got, want := len(flowtables), 1; got != want {
+		t.Fatalf("flowtable entry length mismatch: got %d, want %d", got, want)
+	}
+}
+
+func TestCreateListFlowtableWithDevices(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := &nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	}
+
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Fatalf("net.InterfaceByName() failed: %v", err)
+	}
+
+	flowtable := &nftables.Flowtable{
+		Table:    filter,
+		Name:     "flowtable_test",
+		Devices:  []string{lo.Name},
+		Hooknum:  nftables.FlowtableHookIngress,
+		Priority: nftables.FlowtablePriorityRef(5),
+	}
+
+	c.AddTable(filter)
+	c.AddFlowtable(flowtable)
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	flowtables, err := c.ListFlowtables(filter)
+	if err != nil {
+		t.Fatalf("c.ListFlowtables() failed: %v", err)
+	}
+
+	if got, want := len(flowtables), 1; got != want {
+		t.Fatalf("flowtable entry length mismatch: got %d, want %d", got, want)
+	}
+
+	sysFlowtable := flowtables[0]
+	if got, want := sysFlowtable.Table, flowtable.Table; got != want {
+		t.Errorf("flowtables table mismatch: got %v, want %v", got, want)
+	}
+
+	if got, want := sysFlowtable.Name, flowtable.Name; got != want {
+		t.Errorf("flowtables name mismatch: got %s, want %s", got, want)
+	}
+
+	if len(sysFlowtable.Devices) != 1 {
+		t.Fatalf("expected 1 device in flowtable, got %d", len(sysFlowtable.Devices))
+	}
+
+	if got, want := sysFlowtable.Devices, flowtable.Devices; !reflect.DeepEqual(got, want) {
+		t.Errorf("flowtables device mismatch: got %v, want %v", got, want)
+	}
+
+	if got, want := *sysFlowtable.Hooknum, *flowtable.Hooknum; got != want {
+		t.Errorf("flowtables hook mismatch: got %v, want %v", got, want)
+	}
+
+	if got, want := *sysFlowtable.Priority, *flowtable.Priority; got != want {
+		t.Errorf("flowtables prio mismatch: got %v, want %v", got, want)
+	}
+}
+
+func TestCreateDeleteFlowtable(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := &nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	}
+
+	flowtable := &nftables.Flowtable{
+		Table: filter,
+		Name:  "flowtable_test",
+	}
+
+	c.AddTable(filter)
+	c.AddFlowtable(flowtable)
+	flowtable.Name = "flowtable_test_to_delete"
+	c.AddFlowtable(flowtable)
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	flowtables, err := c.ListFlowtables(filter)
+	if err != nil {
+		t.Fatalf("c.ListFlowtables() failed: %v", err)
+	}
+
+	if got, want := len(flowtables), 2; got != want {
+		t.Fatalf("flowtable entry length mismatch: got %d, want %d", got, want)
+	}
+
+	c.DelFlowtable(flowtable)
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	flowtables, err = c.ListFlowtables(filter)
+	if err != nil {
+		t.Fatalf("c.ListFlowtables() after deletion failed: %v", err)
+	}
+
+	if got, want := len(flowtables), 1; got != want {
+		t.Errorf("flowtable entry length mismatch: got %d, want %d", got, want)
+	}
+
+	if got, removed := flowtables[0].Name, flowtable.Name; got == removed {
+		t.Errorf("wrong flowtable entry deleted")
+	}
+}
+
+func TestOffload(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := &nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	}
+
+	accept := nftables.ChainPolicyAccept
+	forward := &nftables.Chain{
+		Name:     "forward",
+		Table:    filter,
+		Type:     nftables.ChainTypeFilter,
+		Priority: nftables.ChainPriorityFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Policy:   &accept,
+	}
+
+	flowtable := &nftables.Flowtable{
+		Table: filter,
+		Name:  "flowtable_test",
+	}
+
+	c.AddTable(filter)
+	c.AddChain(forward)
+	c.AddFlowtable(flowtable)
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() failed: %v", err)
+	}
+
+	rule := &nftables.Rule{
+		Table: filter,
+		Chain: forward,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				OperationType: expr.PayloadLoad,
+				Base:          expr.PayloadBaseNetworkHeader,
+				Len:           1,
+				Offset:        9,
+				DestRegister:  1,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     []byte{0x06, 0x00, 0x00, 0x00},
+			},
+			&expr.FlowOffload{
+				Name: flowtable.Name,
+			},
+		},
+	}
+	c.AddRule(rule)
+
+	if err := c.Flush(); err != nil {
+		t.Fatalf("c.Flush() offload failed: %v", err)
+	}
+
+	rules, err := c.GetRule(filter, forward)
+	if err != nil {
+		t.Fatalf("c.GetRule() failed: %v", err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("rule count mismatch: got %d, want %d", got, want)
+	}
+
+	sysRule := rules[0]
+	if got, want := sysRule.Exprs, rule.Exprs; !reflect.DeepEqual(got, want) {
+		t.Errorf("rule content mismatch: got %v, want %v", got, want)
+	}
+}
+
 func TestFlushChain(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -2871,8 +3328,8 @@ func TestFlushTable(t *testing.T) {
 	}
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -3095,11 +3552,107 @@ func TestFlushTable(t *testing.T) {
 	}
 }
 
+func TestGetLookupExprDestSet(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+	forward := c.AddChain(&nftables.Chain{
+		Name:     "forward",
+		Table:    filter,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	set := &nftables.Set{
+		Table:    filter,
+		Name:     "test",
+		IsMap:    true,
+		KeyType:  nftables.TypeInetService,
+		DataType: nftables.TypeVerdict,
+	}
+	if err := c.AddSet(set, nil); err != nil {
+		t.Errorf("c.AddSet(set) failed: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: forward,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     []byte{unix.IPPROTO_TCP},
+			},
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseTransportHeader,
+				Offset:       2,
+				Len:          2,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        set.Name,
+				SetID:          set.ID,
+				DestRegister:   0,
+				IsDestRegSet:   true,
+			},
+		},
+	})
+
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(
+		&nftables.Table{
+			Family: nftables.TableFamilyIPv4,
+			Name:   "filter",
+		},
+		&nftables.Chain{
+			Name: "forward",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected number of rules: got %d, want %d", got, want)
+	}
+	if got, want := len(rules[0].Exprs), 4; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+
+	lookup, lookupOk := rules[0].Exprs[3].(*expr.Lookup)
+	if !lookupOk {
+		t.Fatalf("Exprs[3] is type %T, want *expr.Lookup", rules[0].Exprs[3])
+	}
+	if want := (&expr.Lookup{
+		SourceRegister: 1,
+		SetName:        set.Name,
+		DestRegister:   0,
+		IsDestRegSet:   true,
+	}); !reflect.DeepEqual(lookup, want) {
+		t.Errorf("lookup expr = %+v, wanted %+v", lookup, want)
+	}
+}
+
 func TestGetRuleLookupVerdictImmediate(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -3118,7 +3671,7 @@ func TestGetRuleLookupVerdictImmediate(t *testing.T) {
 
 	set := &nftables.Set{
 		Table:   filter,
-		Name:    "kek",
+		Name:    "test",
 		KeyType: nftables.TypeInetService,
 	}
 	if err := c.AddSet(set, nil); err != nil {
@@ -3157,10 +3710,10 @@ func TestGetRuleLookupVerdictImmediate(t *testing.T) {
 			&expr.Verdict{
 				Kind: expr.VerdictAccept,
 			},
-			// [ immediate reg 2 kek ]
+			// [ immediate reg 2 test ]
 			&expr.Immediate{
 				Register: 2,
-				Data:     []byte("kek"),
+				Data:     []byte("test"),
 			},
 		},
 	})
@@ -3216,7 +3769,7 @@ func TestGetRuleLookupVerdictImmediate(t *testing.T) {
 	}
 	if want := (&expr.Immediate{
 		Register: 2,
-		Data:     []byte("kek"),
+		Data:     []byte("test"),
 	}); !reflect.DeepEqual(imm, want) {
 		t.Errorf("verdict expr = %+v, wanted %+v", imm, want)
 	}
@@ -3225,8 +3778,8 @@ func TestGetRuleLookupVerdictImmediate(t *testing.T) {
 func TestDynset(t *testing.T) {
 	// Create a new network namespace to test these operations,
 	// and tear down the namespace at test completion.
-	c, newNS := openSystemNFTConn(t)
-	defer cleanupSystemNFTConn(t, newNS)
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
 	// Clear all rules at the beginning + end of the test.
 	c.FlushRuleset()
 	defer c.FlushRuleset()
@@ -3310,6 +3863,221 @@ func TestDynset(t *testing.T) {
 		Operation: uint32(unix.NFT_DYNSET_OP_UPDATE),
 	}); !reflect.DeepEqual(dynset, want) {
 		t.Errorf("dynset expr = %+v, wanted %+v", dynset, want)
+	}
+}
+
+func TestDynsetWithOneExpression(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+	table := &nftables.Table{
+		Name:   "filter",
+		Family: nftables.TableFamilyIPv4,
+	}
+	chain := &nftables.Chain{
+		Name:     "forward",
+		Hooknum:  nftables.ChainHookForward,
+		Table:    table,
+		Priority: nftables.ChainPriorityRef(0),
+		Type:     nftables.ChainTypeFilter,
+	}
+	set := &nftables.Set{
+		Table:   table,
+		Name:    "myMeter",
+		KeyType: nftables.TypeIPAddr,
+		Dynamic: true,
+	}
+	c.AddTable(table)
+	c.AddChain(chain)
+	if err := c.AddSet(set, nil); err != nil {
+		t.Errorf("c.AddSet(myMeter) failed: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rule := &nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       uint32(12),
+				Len:          uint32(4),
+			},
+			&expr.Dynset{
+				SrcRegKey: 1,
+				SetName:   set.Name,
+				Operation: uint32(unix.NFT_DYNSET_OP_ADD),
+				Exprs: []expr.Any{
+					&expr.Limit{
+						Type:  expr.LimitTypePkts,
+						Rate:  200,
+						Unit:  expr.LimitTimeSecond,
+						Burst: 5,
+					},
+				},
+			},
+			&expr.Verdict{
+				Kind: expr.VerdictDrop,
+			},
+		},
+	}
+	c.AddRule(rule)
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(table, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected number of rules: got %d, want %d", got, want)
+	}
+	if got, want := len(rules[0].Exprs), 3; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+
+	dynset, dynsetOk := rules[0].Exprs[1].(*expr.Dynset)
+	if !dynsetOk {
+		t.Fatalf("Exprs[0] is type %T, want *expr.Dynset", rules[0].Exprs[1])
+	}
+
+	if got, want := len(dynset.Exprs), 1; got != want {
+		t.Fatalf("unexpected number of dynset.Exprs: got %d, want %d", got, want)
+	}
+
+	if got, want := dynset.SetName, set.Name; got != want {
+		t.Fatalf("dynset.SetName is %s, want %s", got, want)
+	}
+
+	if want := (&expr.Limit{
+		Type:  expr.LimitTypePkts,
+		Rate:  200,
+		Unit:  expr.LimitTimeSecond,
+		Burst: 5,
+	}); !reflect.DeepEqual(dynset.Exprs[0], want) {
+		t.Errorf("dynset.Exprs[0] expr = %+v, wanted %+v", dynset.Exprs[0], want)
+	}
+}
+
+func TestDynsetWithMultipleExpressions(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+	table := &nftables.Table{
+		Name:   "filter",
+		Family: nftables.TableFamilyIPv4,
+	}
+	chain := &nftables.Chain{
+		Name:     "forward",
+		Hooknum:  nftables.ChainHookForward,
+		Table:    table,
+		Priority: nftables.ChainPriorityRef(0),
+		Type:     nftables.ChainTypeFilter,
+	}
+	set := &nftables.Set{
+		Table:   table,
+		Name:    "myMeter",
+		KeyType: nftables.TypeIPAddr,
+		Dynamic: true,
+	}
+	c.AddTable(table)
+	c.AddChain(chain)
+	if err := c.AddSet(set, nil); err != nil {
+		t.Errorf("c.AddSet(myMeter) failed: %v", err)
+	}
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rule := &nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       uint32(12),
+				Len:          uint32(4),
+			},
+			&expr.Dynset{
+				SrcRegKey: 1,
+				SetName:   set.Name,
+				Operation: uint32(unix.NFT_DYNSET_OP_ADD),
+				Exprs: []expr.Any{
+					&expr.Connlimit{
+						Count: 20,
+						Flags: 1,
+					},
+					&expr.Limit{
+						Type:  expr.LimitTypePkts,
+						Rate:  10,
+						Unit:  expr.LimitTimeSecond,
+						Burst: 2,
+					},
+				},
+			},
+			&expr.Verdict{
+				Kind: expr.VerdictDrop,
+			},
+		},
+	}
+	c.AddRule(rule)
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(table, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected number of rules: got %d, want %d", got, want)
+	}
+	if got, want := len(rules[0].Exprs), 3; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+
+	dynset, dynsetOk := rules[0].Exprs[1].(*expr.Dynset)
+	if !dynsetOk {
+		t.Fatalf("Exprs[0] is type %T, want *expr.Dynset", rules[0].Exprs[1])
+	}
+
+	if got, want := len(dynset.Exprs), 2; got != want {
+		t.Fatalf("unexpected number of dynset.Exprs: got %d, want %d", got, want)
+	}
+
+	if got, want := dynset.SetName, set.Name; got != want {
+		t.Fatalf("dynset.SetName is %s, want %s", got, want)
+	}
+
+	if want := (&expr.Connlimit{
+		Count: 20,
+		Flags: 1,
+	}); !reflect.DeepEqual(dynset.Exprs[0], want) {
+		t.Errorf("dynset.Exprs[0] expr = %+v, wanted %+v", dynset.Exprs[0], want)
+	}
+
+	if want := (&expr.Limit{
+		Type:  expr.LimitTypePkts,
+		Rate:  10,
+		Unit:  expr.LimitTimeSecond,
+		Burst: 2,
+	}); !reflect.DeepEqual(dynset.Exprs[1], want) {
+		t.Errorf("dynset.Exprs[1] expr = %+v, wanted %+v", dynset.Exprs[1], want)
 	}
 }
 
@@ -3912,7 +4680,6 @@ func TestSet4(t *testing.T) {
 	// Additional details can be obtained by specifying the --debug=all option
 	// when calling nft(8).
 	want := [][]byte{
-
 		// batch begin
 		[]byte("\x00\x00\x00\x0a"),
 
@@ -3986,7 +4753,7 @@ func TestSet4(t *testing.T) {
 		Anonymous: false,
 		Constant:  true,
 		Name:      "test-set",
-		ID:        uint32(1), //rand.Intn(0xffff)),
+		ID:        uint32(1), // rand.Intn(0xffff)),
 		Table:     tbl,
 		KeyType:   nftables.TypeInetService,
 	}
@@ -4846,7 +5613,6 @@ func TestJHash(t *testing.T) {
 }
 
 func TestDup(t *testing.T) {
-
 	// The want byte sequences come from stracing nft(8), e.g.:
 	// strace -f -v -x -s 2048 -eraw=sendto nft add rule filter prerouting mark set jhash ip saddr mod 2
 	//
@@ -4914,7 +5680,6 @@ func TestDup(t *testing.T) {
 	})
 
 	lo, err := net.InterfaceByName("lo")
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4948,7 +5713,6 @@ func TestDup(t *testing.T) {
 }
 
 func TestDupWoDev(t *testing.T) {
-
 	// The want byte sequences come from stracing nft(8), e.g.:
 	// strace -f -v -x -s 2048 -eraw=sendto nft add rule filter prerouting mark set jhash ip saddr mod 2
 	//
@@ -5086,7 +5850,6 @@ func TestNotrack(t *testing.T) {
 }
 
 func TestQuota(t *testing.T) {
-
 	want := [][]byte{
 		// batch begin
 		[]byte("\x00\x00\x00\x0a"),
@@ -5246,5 +6009,247 @@ func TestStatelessNAT(t *testing.T) {
 
 	if err := c.Flush(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGetRulesObjref(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	table := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+
+	chain := c.AddChain(&nftables.Chain{
+		Name:     "forward",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	counterName := "fwded1"
+	c.AddObj(&nftables.CounterObj{
+		Table:   table,
+		Name:    counterName,
+		Bytes:   1,
+		Packets: 1,
+	})
+
+	counterRule := c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Objref{
+				Type: 1,
+				Name: counterName,
+			},
+		},
+	})
+
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(table, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected number of rules: got %d, want %d", got, want)
+	}
+	if got, want := len(rules[0].Exprs), 1; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+	objref, objrefOk := rules[0].Exprs[0].(*expr.Objref)
+	if !objrefOk {
+		t.Fatalf("Exprs[0] is type %T, want *expr.Objref", rules[0].Exprs[0])
+	}
+	if want := counterRule.Exprs[0]; !reflect.DeepEqual(objref, want) {
+		t.Errorf("objref expr = %+v, wanted %+v", objref, want)
+	}
+}
+
+func TestGetRulesQueue(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	table := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+
+	chain := c.AddChain(&nftables.Chain{
+		Name:     "forward",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	queueRule := c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Queue{
+				Num:  1000,
+				Flag: expr.QueueFlagBypass,
+			},
+		},
+	})
+
+	if err := c.Flush(); err != nil {
+		t.Errorf("c.Flush() failed: %v", err)
+	}
+
+	rules, err := c.GetRules(table, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := len(rules), 1; got != want {
+		t.Fatalf("unexpected number of rules: got %d, want %d", got, want)
+	}
+	if got, want := len(rules[0].Exprs), 1; got != want {
+		t.Fatalf("unexpected number of exprs: got %d, want %d", got, want)
+	}
+	queueExpr, ok := rules[0].Exprs[0].(*expr.Queue)
+	if !ok {
+		t.Fatalf("Exprs[0] is type %T, want *expr.Queue", rules[0].Exprs[0])
+	}
+	if want := queueRule.Exprs[0]; !reflect.DeepEqual(queueExpr, want) {
+		t.Errorf("queue expr = %+v, wanted %+v", queueExpr, want)
+	}
+}
+
+func TestNftablesCompat(t *testing.T) {
+	// Create a new network namespace to test these operations,
+	// and tear down the namespace at test completion.
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	// Clear all rules at the beginning + end of the test.
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	filter := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+
+	input := c.AddChain(&nftables.Chain{
+		Name:     "input",
+		Table:    filter,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookInput,
+		Priority: nftables.ChainPriorityFilter,
+	})
+
+	// -tcp --dport 0:65534 --sport 0:65534
+	tcpMatch := &expr.Match{
+		Name: "tcp",
+		Info: &xt.Tcp{
+			SrcPorts: [2]uint16{0, 65534},
+			DstPorts: [2]uint16{0, 65534},
+		},
+	}
+
+	// -udp --dport 0:65534 --sport 0:65534
+	udpMatch := &expr.Match{
+		Name: "udp",
+		Info: &xt.Udp{
+			SrcPorts: [2]uint16{0, 65534},
+			DstPorts: [2]uint16{0, 65534},
+		},
+	}
+
+	// - j TCPMSS --set-mss 1460
+	mess := xt.Unknown([]byte{1460 & 0xff, (1460 >> 8) & 0xff})
+	tcpMessTarget := &expr.Target{
+		Name: "TCPMSS",
+		Info: &mess,
+	}
+
+	// -m state --state ESTABLISHED
+	ctMatch := &expr.Match{
+		Name: "conntrack",
+		Rev:  1,
+		Info: &xt.ConntrackMtinfo1{
+			ConntrackMtinfoBase: xt.ConntrackMtinfoBase{
+				MatchFlags: 0x2001,
+			},
+			StateMask: 0x02,
+		},
+	}
+
+	// -p tcp --dport --dport 0:65534 --sport 0:65534 -m state --state ESTABLISHED -j TCPMSS --set-mss 1460
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: input,
+		Exprs: []expr.Any{
+			tcpMatch,
+			ctMatch,
+			tcpMessTarget,
+		},
+	})
+	if err := c.Flush(); err != nil {
+		t.Fatalf("add rule fail %#v", err)
+	}
+
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: input,
+		Exprs: []expr.Any{
+			udpMatch,
+			&expr.Verdict{
+				Kind: expr.VerdictAccept,
+			},
+		},
+	})
+	if err := c.Flush(); err != nil {
+		t.Fatalf("add rule %#v fail", err)
+	}
+
+	// -m state --state ESTABLISHED -j ACCEPT
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: input,
+		Exprs: []expr.Any{
+			ctMatch,
+			&expr.Verdict{
+				Kind: expr.VerdictAccept,
+			},
+		},
+	})
+	if err := c.Flush(); err != nil {
+		t.Fatalf("add rule %#v fail", err)
+	}
+
+	// -p udp --dport --dport 0:65534 --sport 0:65534 -m state --state ESTABLISHED -j ACCEPT
+	c.AddRule(&nftables.Rule{
+		Table: filter,
+		Chain: input,
+		Exprs: []expr.Any{
+			tcpMatch,
+			udpMatch,
+			ctMatch,
+			&expr.Verdict{
+				Kind: expr.VerdictAccept,
+			},
+		},
+	})
+	if err := c.Flush(); err == nil {
+		t.Fatalf("compat policy should conflict and err should not be err")
 	}
 }
